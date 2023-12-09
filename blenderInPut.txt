@@ -1,0 +1,178 @@
+import bpy
+import socket
+import json
+
+def create_sphere_at_location(location, diameter=0.1, idx=0):
+    """Create a UV sphere at the specified location."""
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=diameter, location=location)
+    sphere = bpy.context.object
+    sphere.name = f"KP_Sphere_{idx}"  # Assign a unique name with index
+
+    # Create a simple material with a distinct color
+    mat = bpy.data.materials.get("KP_Material")
+    if not mat:
+        mat = bpy.data.materials.new(name="KP_Material")
+        mat.diffuse_color = (1, 0, 0, 1)  # Red color
+    if len(sphere.data.materials):
+        sphere.data.materials[0] = mat
+    else:
+        sphere.data.materials.append(mat)
+
+    return sphere
+
+def clear_visualization():
+    """Remove all objects created by the visualization (with 'KP', 'Keypoint_Lines', or 'KP_Text' prefix)."""
+    for obj in bpy.data.objects:
+        if obj.name.startswith("KP") or obj.name.startswith("Keypoint_Lines") or obj.name.startswith("KP_Text"):
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+def visualize_keypoints(keypoints, numbers):
+    """Visualize keypoints by creating spheres, drawing lines, and displaying numbers."""
+    clear_visualization()
+    scale_factor = 0.01  # Adjust this scaling factor as needed
+    translation = (0, 0, 0)  # Adjust translation if needed
+    spheres = []  # This will hold the locations of the spheres
+
+    for idx, (x, y, z) in enumerate(keypoints):
+        x, y, z = (x * scale_factor, y * scale_factor, z * scale_factor)  # Apply scaling
+        x, y, z = (x + translation[0], y + translation[1], z + translation[2])  # Apply translation
+        location = (x, y, z)  # Convert to Blender's coordinate system if necessary
+        sphere = create_sphere_at_location(location, diameter=0.1, idx=idx)
+        spheres.append(location)  # Store the location for line drawing
+
+        # Display the number near the keypoint
+        number_location = (x, y, z + 0.1)  # Adjust the height as needed
+        create_text_at_location(str(numbers[idx]), number_location, size=0.1)
+
+    draw_lines_between_keypoints(spheres, keypoint_connections)
+        
+keypoint_connections = [
+    #(0, 1), (0, 2), (2, 4),(1, 3),(5, 7),
+    #(7, 9), (6, 8), (8, 10), (11, 13), (13, 15),
+    #(12, 14), (14, 16),   # Example connections
+    # Add the rest of the connections according to the keypoints
+    (0,1),(1,2),(2,3),(3,4),(4,5),(5,6),(6,7),(7,8),(8,9),(9,10),(10,11),(11,12),
+]
+
+def draw_lines_between_keypoints(keypoints, connections):
+    """Draw lines between the given keypoints based on the connections."""
+    # Filter out connections where keypoints are missing or set to (0, 0, 0)
+    valid_connections = [c for c in connections if all(i < len(keypoints) and keypoints[i] != (0, 0, 0) for i in c)]
+
+    if not valid_connections:  # If no valid connections, don't create the mesh
+        return
+
+    # First, create a new mesh to hold the vertices and edges
+    mesh = bpy.data.meshes.new(name="Keypoint_Lines")
+    obj = bpy.data.objects.new("Keypoint_Lines_Obj", mesh)
+
+    # Link the object to the scene
+    bpy.context.collection.objects.link(obj)
+
+    # Generate vertices and edges data from keypoints and valid connections
+    vertices = [keypoints[i] for i in range(len(keypoints)) if keypoints[i] != (0, 0, 0)]
+    edges = [(c[0], c[1]) for c in valid_connections]
+
+    # Create the mesh from the vertices and edges
+    mesh.from_pydata(vertices, edges, [])
+    mesh.update()
+
+    # Set the mesh to be the active object for display
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+
+
+def create_text_at_location(text, location, size=0.5):
+    """Create a text object at the specified location."""
+    bpy.ops.object.text_add(location=location)
+    txt_obj = bpy.context.object
+    txt_obj.name = f"KP_Text_{text}"  # Assign a unique name with the text label
+    txt_obj.data.body = text
+    txt_obj.data.size = size
+    return txt_obj
+
+class ReceiveKeypointsOperator(bpy.types.Operator):
+    """Operator which runs itself from a timer"""
+    bl_idname = "wm.receive_keypoints"
+    bl_label = "Receive Keypoints"
+
+    _timer = None
+    _socket = None
+
+    def modal(self, context, event):
+        if event.type == 'TIMER':
+            try:
+                data = self._socket.recv(8192).decode('utf-8')
+                if data:
+                    try:
+                        json_data = json.loads(data)
+                    except json.JSONDecodeError as e:
+                        print(f"JSON parsing error: {e}")
+                        # Skip the rest of this iteration and proceed to the next
+                    else:
+                        # This block only executes if json.loads() is successful
+                        if 'keypoints' in json_data and 'labels' in json_data:
+                            keypoints = [(kp[0], kp[1], 0.0) for kp in zip(json_data['keypoints'][::3], json_data['keypoints'][1::3])]
+                            labels = json_data['labels']
+                            visualize_keypoints(keypoints, labels)  # Pass labels to visualize_keypoints
+                        else:
+                            print("Error: Invalid data format received")
+
+                        if self._socket:  # Check if socket is still connected
+                            self._socket.sendall(b'ack')
+            except BlockingIOError:
+                pass  # No data received, continue
+            except Exception as e:
+                self.report({'ERROR'}, f"Socket error: {e}")
+                self._socket.close()
+                return {'CANCELLED'}
+        elif context.window_manager.keypoints_received:
+            # Stop this modal operator
+            self._socket.close()
+            return {'CANCELLED'}
+        else:
+            # This is needed to keep the modal loop running
+            return {'PASS_THROUGH'}
+
+        return {'PASS_THROUGH'}
+
+
+
+    def execute(self, context):
+        context.window_manager.keypoints_received = False
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.1, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        wm = context.window_manager
+        wm.event_timer_remove(self._timer)
+        if self._socket:
+            self._socket.close()
+        return {'CANCELLED'}
+
+    def invoke(self, context, event):
+        self._socket = setup_socket_client('127.0.0.1', 12345)
+        self._socket.setblocking(False)  # Set the socket to non-blocking mode
+        self.execute(context)
+        return {'RUNNING_MODAL'}
+
+def setup_socket_client(ip, port):
+    """Set up a socket client in Blender."""
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_socket.connect((ip, port))
+    return client_socket
+
+def register():
+    bpy.utils.register_class(ReceiveKeypointsOperator)
+    bpy.types.WindowManager.keypoints_received = bpy.props.BoolProperty(default=False)
+
+def unregister():
+    bpy.utils.unregister_class(ReceiveKeypointsOperator)
+    del bpy.types.WindowManager.keypoints_received
+
+if __name__ == "__main__":
+    register()
+    # The operator is called here to register it, then invoked to start it
+    bpy.ops.wm.receive_keypoints('INVOKE_DEFAULT')
